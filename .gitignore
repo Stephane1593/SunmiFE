@@ -1,0 +1,47 @@
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# Android
+*.apk
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Gradle
+.gradle
+wrapper/gradle-wrapper.jar
+
+# IDE
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Keys & Secrets
+*.keystore
+*.jks
+keystore.properties
+secrets.properties
+.env
