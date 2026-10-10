@@ -11,13 +11,26 @@ data class OrderDto(
     val currency: String
 )
 
+data class OrderQrResponse(
+    val token: String,
+    val kind: String,          // "Fiscal" | "Provisional"
+    val order: OrderDto
+)
+
 interface SfeApi {
 
     @GET("orders")
     suspend fun getOrders(): List<OrderDto>
 
+    /**
+     * Remove/cancel an order from the pending store.
+     * Returns 204 No Content on success, 404 if not found.
+     */
     @DELETE("orders/{id}")
-    suspend fun clearOrder(@Path("id") id: String)
+    suspend fun cancelOrder(@Path("id") id: String): Response<Unit>
+
+    // Alias for clarity (optional, for backward compat)
+    suspend fun clearOrder(id: String) = cancelOrder(id)
 
     // ── Receipts (ESC/POS bytes, streamed back as application/vnd.escpos) ──
 
@@ -29,29 +42,23 @@ interface SfeApi {
     @GET("receipts/fiscal/{id}")
     suspend fun getFiscalReceipt(@Path("id") id: String): Response<ResponseBody>
 
-    // ── NEW: Receipts as JSON (for Sunmi rendering) ──
+    // ── Receipts as JSON (for Sunmi rendering) ──
 
-    /**
-     * Fetch proforma receipt as JSON structure.
-     * Query param `copies` controls how many originals/duplicatas to generate.
-     */
     @GET("receipts/json/proforma/{id}")
     suspend fun getProformaReceiptJson(
         @Path("id") id: String,
-        @Query("copies") copies: Int = 1
+        @Query("copies") copies: Int = 1,
+        @Query("paymentMethod") paymentMethod: String? = null
     ): ReceiptResponse
 
-    /**
-     * Fetch fiscal receipt as JSON structure.
-     * Query param `copies` controls how many originals/duplicatas to generate.
-     */
     @GET("receipts/json/fiscal/{id}")
     suspend fun getFiscalReceiptJson(
         @Path("id") id: String,
-        @Query("copies") copies: Int = 1
+        @Query("copies") copies: Int = 1,
+        @Query("paymentMethod") paymentMethod: String? = null
     ): ReceiptResponse
 
-    // ── Payments (unchanged) ──
+    // ── Payments ──
 
     @POST("payments")
     suspend fun initiatePayment(@Body request: InitiatePaymentRequest): PaymentDto
@@ -64,4 +71,10 @@ interface SfeApi {
         @Path("id") id: String,
         @Body report: PaymentResultReport
     ): PaymentDto
+
+    @GET("services/payments/payment/verify")
+    suspend fun verifyPayment(
+        @Query("transactionReference") transactionReference: String,
+        @Query("paymentMethod") paymentMethod: String? = null
+    ): GatewayVerifyResponse
 }

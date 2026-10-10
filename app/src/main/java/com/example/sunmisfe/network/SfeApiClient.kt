@@ -71,4 +71,14 @@ object SfeApiClient {
             return chain.proceed(req)
         }
     }
+
+    suspend fun cancelOrderSafe(orderId: String): Boolean {
+        return try {
+            val response = api.cancelOrder(orderId)
+            response.isSuccessful
+        } catch (e: Exception) {
+            android.util.Log.e("SfeApiClient", "Cancel order failed", e)
+            false
+        }
+    }
 }

@@ -79,4 +79,11 @@ dependencies {
     // Debug
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+    // Encryption
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("androidx.compose.material:material-icons-extended:1.6.8")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }
