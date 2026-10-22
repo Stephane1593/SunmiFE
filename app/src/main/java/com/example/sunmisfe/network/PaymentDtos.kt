@@ -48,6 +48,15 @@ data class PaymentDto(
 }
 
 /**
+ * NEW: Matches C# TerminalPaymentLine to send split payment data
+ */
+data class TerminalPaymentLine(
+    val paymentType: String,
+    val amount: Double,
+    val mobileOperator: String?
+)
+
+/**
  * Matches C# PaymentResultReport(
  *     PaymentTransactionStatus Status, string? ProviderRef, string? Reason).
  *
@@ -57,5 +66,6 @@ data class PaymentDto(
 data class PaymentResultReport(
     val status: String,
     val providerRef: String? = null,
-    val reason: String? = null
+    val reason: String? = null,
+    val splitPayments: List<TerminalPaymentLine>? = null
 )

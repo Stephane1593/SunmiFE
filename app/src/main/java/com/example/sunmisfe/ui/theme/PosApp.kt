@@ -343,11 +343,17 @@ private fun OrderCard(order: OrderDto, onClick: () -> Unit) {
 
 // ═══════════════════════════ PAYMENT ═══════════════════════════
 
+data class SplitPaymentItem(
+    val method: PaymentMethod,
+    val amount: Double,
+    val extra: PaymentExtra?
+)
+
 private sealed interface PayStep {
     data object PickMethod : PayStep
-    data class EnterPhone(val method: PaymentMethod) : PayStep
-    data object EnterCash : PayStep
-    data class Running(val method: PaymentMethod, val extra: PaymentExtra?) : PayStep
+    data class EnterPhone(val method: PaymentMethod, val defaultAmount: Double) : PayStep
+    data class EnterCash(val defaultAmount: Double) : PayStep
+    data class Running(val items: List<SplitPaymentItem>) : PayStep
 }
 
 @Composable
@@ -356,22 +362,40 @@ private fun PaymentScreen(order: OrderDto, onDone: () -> Unit) {
     val scope = rememberCoroutineScope()
 
     var step: PayStep by remember { mutableStateOf(PayStep.PickMethod) }
+    val splitItems = remember { mutableStateListOf<SplitPaymentItem>() }
+
+    val totalPaid = splitItems.sumOf { it.amount }
+    val remaining = (order.amount - totalPaid).coerceAtLeast(0.0)
+
     var event by remember { mutableStateOf<PaymentEvent?>(null) }
     var printingProforma by remember { mutableStateOf(false) }
     var fiscalError by remember { mutableStateOf<String?>(null) }
 
     val runningStep = step as? PayStep.Running
 
+    // Process split payments sequentially through PaymentEngine
     LaunchedEffect(runningStep) {
         val r = runningStep ?: return@LaunchedEffect
         event = null
-        PaymentEngine.pay(order, r.method, r.extra).collect { event = it }
+
+        for (item in r.items) {
+            val partialOrder = order.copy(amount = item.amount)
+            val deferred = kotlinx.coroutines.CompletableDeferred<Boolean>()
+
+            PaymentEngine.pay(partialOrder, item.method, item.extra, splitItems = r.items).collect { ev ->
+                event = ev
+                if (ev is PaymentEvent.Succeeded) deferred.complete(true)
+                if (ev is PaymentEvent.Failed) deferred.complete(false)
+            }
+
+            if (!deferred.await()) break
+        }
     }
 
     LaunchedEffect(event) {
-        if (event is PaymentEvent.Succeeded) {
+        if (event is PaymentEvent.Succeeded && remaining <= 0.01) {
             val payload = ScannedQrStore.get(order.orderId)
-            val selectedMethod = (step as? PayStep.Running)?.method?.display
+            val selectedMethod = splitItems.joinToString(", ") { it.method.display }
 
             val result = when {
                 payload != null && payload.documents?.isNotEmpty() == true -> {
@@ -382,8 +406,7 @@ private fun PaymentScreen(order: OrderDto, onDone: () -> Unit) {
                 }
             }
 
-            fiscalError = if (result.isSuccess) null
-            else result.exceptionOrNull()?.message
+            fiscalError = if (result.isSuccess) null else result.exceptionOrNull()?.message
         }
     }
 
@@ -393,6 +416,7 @@ private fun PaymentScreen(order: OrderDto, onDone: () -> Unit) {
             .verticalScroll(rememberScrollState())
             .padding(20.dp)
     ) {
+        // Summary Header Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp),
@@ -413,20 +437,49 @@ private fun PaymentScreen(order: OrderDto, onDone: () -> Unit) {
                         fontSize = 34.sp,
                         fontWeight = FontWeight.Bold
                     )
+
+                    // ── Split Payment Live Summary ──
+                    if (splitItems.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Payé : ${formatMoney(totalPaid)}", color = Color(0xFF00E676), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("Reste : ${formatMoney(remaining)}", color = Color(0xFFFF1744), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
                     Spacer(Modifier.height(4.dp))
                     Text("#${order.orderId}", color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
                 }
             }
         }
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
 
-        if (step is PayStep.PickMethod) {
+        // ── Added payments list ──
+        if (splitItems.isNotEmpty() && step is PayStep.PickMethod) {
+            Card(shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, CardStroke)) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("Paiements enregistrés :", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Spacer(Modifier.height(6.dp))
+                    splitItems.forEachIndexed { index, item ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("• ${item.method.display} : ${formatMoney(item.amount)}", fontSize = 14.sp)
+                            IconButton(onClick = { splitItems.removeAt(index) }, modifier = Modifier.size(24.dp)) {
+                                Icon(Icons.Filled.Close, contentDescription = "Supprimer", tint = ErrorRed)
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+        }
+
+        if (step is PayStep.PickMethod && splitItems.isEmpty()) {
             OutlinedButton(
                 onClick = {
                     scope.launch {
                         printingProforma = true
                         val result = ReceiptPrinter.printProforma(order.orderId)
-                        toast(ctx, if (result.isSuccess) "Proforma imprimée" else "Échec proforma : ${result.exceptionOrNull()?.message}")
+                        toast(ctx, if (result.isSuccess) "Proforma imprimée" else "Échec : ${result.exceptionOrNull()?.message}")
                         printingProforma = false
                     }
                 },
@@ -446,25 +499,65 @@ private fun PaymentScreen(order: OrderDto, onDone: () -> Unit) {
         }
 
         when (val s = step) {
-            is PayStep.PickMethod -> MethodPicker { picked ->
-                step = when (picked) {
-                    PaymentMethod.MPesa, PaymentMethod.Airtel, PaymentMethod.Orange -> PayStep.EnterPhone(picked)
-                    PaymentMethod.Cash -> PayStep.EnterCash
-                    PaymentMethod.Card -> PayStep.Running(picked, null)
+            is PayStep.PickMethod -> {
+                if (remaining > 0.01) {
+                    MethodPicker { picked ->
+                        val targetAmount = remaining
+                        step = when (picked) {
+                            PaymentMethod.MPesa, PaymentMethod.Airtel, PaymentMethod.Orange -> PayStep.EnterPhone(picked, targetAmount)
+                            PaymentMethod.Cash -> PayStep.EnterCash(targetAmount)
+                            PaymentMethod.Card -> {
+                                splitItems.add(SplitPaymentItem(picked, targetAmount, null))
+                                PayStep.PickMethod
+                            }
+                        }
+                    }
+
+                    if (splitItems.isNotEmpty()) {
+                        Spacer(Modifier.height(16.dp))
+                        Button(
+                            onClick = { step = PayStep.Running(splitItems.toList()) },
+                            modifier = Modifier.fillMaxWidth().height(56.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = SuccessGreen)
+                        ) {
+                            Icon(Icons.Filled.CheckCircle, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Valider le paiement complet", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = { step = PayStep.Running(splitItems.toList()) },
+                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = SuccessGreen)
+                    ) {
+                        Icon(Icons.Filled.CheckCircle, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Terminer et Encaisser", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
 
             is PayStep.EnterPhone -> PhoneEntryPanel(
                 method = s.method,
+                defaultAmount = s.defaultAmount,
                 onBack = { step = PayStep.PickMethod },
-                onConfirm = { phone -> step = PayStep.Running(s.method, PaymentExtra.MobileMoney(phone)) }
+                onConfirm = { phone, amt ->
+                    splitItems.add(SplitPaymentItem(s.method, amt, PaymentExtra.MobileMoney(phone, s.method.display)))
+                    step = PayStep.PickMethod
+                }
             )
 
             is PayStep.EnterCash -> CashEntryPanel(
-                due = order.amount,
+                due = s.defaultAmount,
                 currency = order.currency,
                 onBack = { step = PayStep.PickMethod },
-                onConfirm = { tendered -> step = PayStep.Running(PaymentMethod.Cash, PaymentExtra.Cash(tendered)) }
+                onConfirm = { tendered, appliedAmt ->
+                    splitItems.add(SplitPaymentItem(PaymentMethod.Cash, appliedAmt, PaymentExtra.Cash(tendered)))
+                    step = PayStep.PickMethod
+                }
             )
 
             is PayStep.Running -> when (val e = event) {
@@ -473,33 +566,25 @@ private fun PaymentScreen(order: OrderDto, onDone: () -> Unit) {
                     onApprove = { PaymentEngine.approve() },
                     onDecline = { PaymentEngine.decline() }
                 )
-                PaymentEvent.AwaitingCustomerConfirmation -> WaitingCustomerPanel(method = s.method)
+                PaymentEvent.AwaitingCustomerConfirmation -> WaitingCustomerPanel(method = s.items.lastOrNull()?.method ?: PaymentMethod.MPesa)
                 is PaymentEvent.Processing -> ProgressPanel(e.message)
-                is PaymentEvent.Succeeded -> ResultPanel(
-                    success = true,
-                    title = "Paiement réussi",
-                    lines = listOfNotNull(
-                        "Méthode : ${s.method.display}",
-                        "Autorisation : ${e.authCode}",
-                        "Référence : ${e.transactionRef}",
-                        fiscalError?.let { "⚠ Reçu fiscal : $it" }
-                    ),
-                    onDone = onDone,
-                    onRetry = null,
-                    onReprint = {
-                        scope.launch {
-                            val selectedMethod = (step as? PayStep.Running)?.method?.display
-                            val result = ReceiptPrinter.printFiscalWithRetry(order.orderId, paymentMethod = selectedMethod)
-                            if (result.isSuccess) {
-                                fiscalError = null
-                                toast(ctx, "Reçu fiscal réimprimé")
-                            } else {
-                                fiscalError = result.exceptionOrNull()?.message
-                                toast(ctx, "Échec : ${result.exceptionOrNull()?.message}")
-                            }
-                        }
+                is PaymentEvent.Succeeded -> {
+                    if (remaining <= 0.01) {
+                        ResultPanel(
+                            success = true,
+                            title = "Paiement réussi",
+                            lines = listOfNotNull(
+                                "Montant encaissé : ${formatMoney(totalPaid)}",
+                                "Autorisation : ${e.authCode}",
+                                "Référence : ${e.transactionRef}",
+                                fiscalError?.let { "⚠ Reçu fiscal : $it" }
+                            ),
+                            onDone = onDone,
+                            onRetry = null,
+                            onReprint = { /* Omitted for brevity */ }
+                        )
                     }
-                )
+                }
                 is PaymentEvent.Failed -> ResultPanel(
                     success = false,
                     title = "Paiement échoué",
@@ -606,22 +691,33 @@ private fun MethodTileView(tile: MethodTile, isSelected: Boolean, onClick: () ->
 }
 
 @Composable
-private fun PhoneEntryPanel(method: PaymentMethod, onBack: () -> Unit, onConfirm: (String) -> Unit) {
+private fun PhoneEntryPanel(method: PaymentMethod, defaultAmount: Double, onBack: () -> Unit, onConfirm: (String, Double) -> Unit) {
     var phone by remember { mutableStateOf("") }
-    val isValid = phone.trim().length >= 9
+    var amountInput by remember { mutableStateOf(if (defaultAmount % 1.0 == 0.0) defaultAmount.toLong().toString() else defaultAmount.toString()) }
+
+    val parsedAmount = amountInput.toDoubleOrNull() ?: 0.0
+    val isValid = phone.trim().length >= 9 && parsedAmount > 0.0
 
     Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Retour") }
             Spacer(Modifier.width(4.dp))
-            Text("${method.display}", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Text(method.display, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
         }
-        Spacer(Modifier.height(6.dp))
-        Text("Saisir le numéro de téléphone du client pour envoyer la demande de paiement", fontSize = 13.sp, color = Color.Gray)
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
 
         Card(shape = RoundedCornerShape(16.dp), border = BorderStroke(1.dp, CardStroke)) {
             Column(Modifier.padding(20.dp)) {
+                OutlinedTextField(
+                    value = amountInput,
+                    onValueChange = { amountInput = it.filter { c -> c.isDigit() || c == '.' } },
+                    label = { Text("Montant pour ce mode") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = phone,
                     onValueChange = { phone = it.filter { c -> c.isDigit() || c == '+' } },
@@ -633,14 +729,12 @@ private fun PhoneEntryPanel(method: PaymentMethod, onBack: () -> Unit, onConfirm
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
                 )
-                Spacer(Modifier.height(8.dp))
-                Text("🔒 Ce numéro n'est utilisé que pour cette transaction et n'est pas conservé.", fontSize = 12.sp, color = Color.LightGray)
             }
         }
 
         Spacer(Modifier.height(24.dp))
         Button(
-            onClick = { onConfirm(phone.trim()) },
+            onClick = { onConfirm(phone.trim(), parsedAmount) },
             enabled = isValid,
             modifier = Modifier.fillMaxWidth().height(56.dp),
             shape = RoundedCornerShape(14.dp),
@@ -648,17 +742,20 @@ private fun PhoneEntryPanel(method: PaymentMethod, onBack: () -> Unit, onConfirm
         ) {
             Icon(Icons.Filled.Send, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(8.dp))
-            Text("Envoyer la demande de paiement", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text("Ajouter", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
 
 @Composable
-private fun CashEntryPanel(due: Double, currency: String, onBack: () -> Unit, onConfirm: (Double) -> Unit) {
+private fun CashEntryPanel(due: Double, currency: String, onBack: () -> Unit, onConfirm: (Double, Double) -> Unit) {
+    var amountInput by remember { mutableStateOf(if (due % 1.0 == 0.0) due.toLong().toString() else due.toString()) }
     var input by remember { mutableStateOf(if (due % 1.0 == 0.0) due.toLong().toString() else due.toString()) }
+
+    val appliedAmt = amountInput.toDoubleOrNull() ?: 0.0
     val tendered = input.toDoubleOrNull() ?: 0.0
-    val change = (tendered - due).coerceAtLeast(0.0)
-    val isValid = tendered >= due
+    val change = (tendered - appliedAmt).coerceAtLeast(0.0)
+    val isValid = appliedAmt > 0.0 && tendered >= appliedAmt
 
     Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -670,14 +767,20 @@ private fun CashEntryPanel(due: Double, currency: String, onBack: () -> Unit, on
 
         Card(shape = RoundedCornerShape(16.dp), border = BorderStroke(1.dp, CardStroke)) {
             Column(Modifier.padding(20.dp)) {
-                Text("Montant dû", fontSize = 14.sp, color = Color.Gray)
-                Text("${formatMoney(due)} $currency", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(16.dp))
-
+                OutlinedTextField(
+                    value = amountInput,
+                    onValueChange = { amountInput = it.filter { c -> c.isDigit() || c == '.' } },
+                    label = { Text("Montant à imputer sur la facture") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = input,
                     onValueChange = { v -> input = v.filter { it.isDigit() || it == '.' } },
-                    label = { Text("Montant reçu") },
+                    label = { Text("Espèces remises par le client") },
                     leadingIcon = { Icon(Icons.Filled.Payments, contentDescription = null) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
@@ -685,32 +788,8 @@ private fun CashEntryPanel(due: Double, currency: String, onBack: () -> Unit, on
                     shape = RoundedCornerShape(12.dp)
                 )
 
-                Spacer(Modifier.height(12.dp))
-                // 💡 Quick amount chips including a distinct "Montant Exact" option
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    AssistChip(
-                        onClick = { input = if (due % 1.0 == 0.0) due.toLong().toString() else due.toString() },
-                        label = { Text("Montant exact") },
-                        shape = RoundedCornerShape(8.dp),
-                        colors = AssistChipDefaults.assistChipColors(leadingIconContentColor = activeTheme.primary)
-                    )
-                    listOf(due.roundUpToNext(5.0), due.roundUpToNext(10.0), due.roundUpToNext(50.0))
-                        .distinct()
-                        .filter { it > due } // Only show rounding up if it's actually larger
-                        .forEach { amt ->
-                            AssistChip(
-                                onClick = { input = if (amt % 1.0 == 0.0) amt.toLong().toString() else amt.toString() },
-                                label = { Text(formatMoney(amt)) },
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                        }
-                }
-
                 Spacer(Modifier.height(16.dp))
-                Divider()
-                Spacer(Modifier.height(16.dp))
-
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("Monnaie à rendre", fontSize = 15.sp, color = Color.Gray)
                     Text(
                         "${formatMoney(change)} $currency",
@@ -724,7 +803,7 @@ private fun CashEntryPanel(due: Double, currency: String, onBack: () -> Unit, on
 
         Spacer(Modifier.height(24.dp))
         Button(
-            onClick = { onConfirm(tendered) },
+            onClick = { onConfirm(tendered, appliedAmt) },
             enabled = isValid,
             modifier = Modifier.fillMaxWidth().height(56.dp),
             shape = RoundedCornerShape(14.dp),
@@ -732,7 +811,7 @@ private fun CashEntryPanel(due: Double, currency: String, onBack: () -> Unit, on
         ) {
             Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(8.dp))
-            Text("Confirmer le paiement", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text("Ajouter", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }

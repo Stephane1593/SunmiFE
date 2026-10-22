@@ -10,11 +10,14 @@ import com.example.sunmisfe.network.OrderDto
 import com.example.sunmisfe.network.PaymentGatewayClient
 import com.example.sunmisfe.network.PaymentResultReport
 import com.example.sunmisfe.network.SfeApiClient
+import com.example.sunmisfe.network.TerminalPaymentLine
+import com.example.sunmisfe.ui.theme.SplitPaymentItem
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
+import java.util.Locale
 import java.util.UUID
 
 sealed interface PaymentEvent {
@@ -28,7 +31,7 @@ sealed interface PaymentEvent {
 
 /** Extra input required before/along with [PaymentEngine.pay] for certain methods. */
 sealed interface PaymentExtra {
-    data class MobileMoney(val phone: String) : PaymentExtra
+    data class MobileMoney(val phone: String, val operatorName: String) : PaymentExtra
     data class Cash(val tenderedAmount: Double) : PaymentExtra
 }
 
@@ -50,13 +53,14 @@ object PaymentEngine {
         order: OrderDto,
         method: PaymentMethod,
         extra: PaymentExtra? = null,
-        terminalId: String = TerminalConfig.terminalId
+        terminalId: String = TerminalConfig.terminalId,
+        splitItems: List<SplitPaymentItem>? = null // 🆕 ADDED
     ): Flow<PaymentEvent> {
         val base = when {
             SIMULATE_LOCALLY -> simulate(order, method)
-            method == PaymentMethod.Cash -> cash(order, extra as? PaymentExtra.Cash, terminalId)
-            method.isMobileMoney() -> mobileMoney(order, method, extra as? PaymentExtra.MobileMoney, terminalId)
-            else -> card(order, method, terminalId) // Card
+            method == PaymentMethod.Cash -> cash(order, extra as? PaymentExtra.Cash, terminalId, splitItems)
+            method.isMobileMoney() -> mobileMoney(order, method, extra as? PaymentExtra.MobileMoney, terminalId, splitItems)
+            else -> card(order, method, terminalId, splitItems) // Card
         }
         return base.catch { e ->
             Log.e(TAG, "Uncaught in payment flow", e)
@@ -67,6 +71,18 @@ object PaymentEngine {
     private fun PaymentMethod.isMobileMoney() =
         this == PaymentMethod.MPesa || this == PaymentMethod.Airtel || this == PaymentMethod.Orange
 
+    // Helper to format split payments safely for the API
+    private fun mapSplits(splitItems: List<SplitPaymentItem>?): List<TerminalPaymentLine>? {
+        if (splitItems.isNullOrEmpty()) return null
+        return splitItems.map {
+            TerminalPaymentLine(
+                paymentType = it.method.wire,
+                amount = it.amount,
+                mobileOperator = (it.extra as? PaymentExtra.MobileMoney)?.operatorName
+            )
+        }
+    }
+
     // ── SIMULATION (kept for offline dev/testing) ──────────────
     private fun simulate(order: OrderDto, method: PaymentMethod): Flow<PaymentEvent> = flow {
         emit(PaymentEvent.Initiating)
@@ -76,7 +92,7 @@ object PaymentEngine {
         emit(PaymentEvent.Processing("Autorisation en cours..."))
         delay(1500)
 
-        if ("%.2f".format(order.amount).endsWith(".99")) {
+        if (String.format(Locale.US, "%.2f", order.amount).endsWith(".99")) {
             emit(PaymentEvent.Failed("Fonds insuffisants (simulé)"))
         } else {
             emit(
@@ -93,7 +109,8 @@ object PaymentEngine {
     private fun card(
         order: OrderDto,
         method: PaymentMethod,
-        terminalId: String
+        terminalId: String,
+        splitItems: List<SplitPaymentItem>?
     ): Flow<PaymentEvent> = flow {
         val api = SfeApiClient.api
         val idempotencyKey = order.orderId
@@ -136,7 +153,8 @@ object PaymentEngine {
                 PaymentResultReport(
                     status      = wireStatus,
                     providerRef = "SUNMI-${txId.take(6)}",
-                    reason      = if (wireStatus == "Declined") "Refusé sur terminal" else null
+                    reason      = if (wireStatus == "Declined") "Refusé sur terminal" else null,
+                    splitPayments = if (wireStatus == "Approved") mapSplits(splitItems) else null // 🆕
                 )
             )
         }
@@ -161,7 +179,8 @@ object PaymentEngine {
     private fun cash(
         order: OrderDto,
         extra: PaymentExtra.Cash?,
-        terminalId: String
+        terminalId: String,
+        splitItems: List<SplitPaymentItem>?
     ): Flow<PaymentEvent> = flow {
         val tendered = extra?.tenderedAmount
         if (tendered == null || tendered < order.amount) {
@@ -199,7 +218,8 @@ object PaymentEngine {
                 PaymentResultReport(
                     status = "Approved",
                     providerRef = "CASH-${txId.take(6)}",
-                    reason = null
+                    reason = null,
+                    splitPayments = mapSplits(splitItems) // 🆕
                 )
             )
         }
@@ -221,7 +241,8 @@ object PaymentEngine {
         order: OrderDto,
         method: PaymentMethod,
         extra: PaymentExtra.MobileMoney?,
-        terminalId: String
+        terminalId: String,
+        splitItems: List<SplitPaymentItem>?
     ): Flow<PaymentEvent> = flow {
         val phone = extra?.phone?.trim().orEmpty()
         if (phone.isBlank()) {
@@ -238,7 +259,6 @@ object PaymentEngine {
         val till = SfeApiClient.api
         val idempotencyKey = order.orderId
 
-        // 1. Tell the till a payment attempt is starting
         emit(PaymentEvent.Initiating)
         val initiatedTill = try {
             till.initiatePayment(
@@ -258,7 +278,6 @@ object PaymentEngine {
         }
         val txId = initiatedTill.idempotencyKey.ifBlank { idempotencyKey }
 
-        // 2. Initiate on the payment gateway
         emit(PaymentEvent.Processing("${method.display} — envoi de la demande de paiement..."))
         Log.d(TAG, "Gateway init order=${order.orderId} provider=${method.wire} phone=${maskPhone(phone)}")
 
@@ -297,10 +316,7 @@ object PaymentEngine {
         }
         Log.d(TAG, "Gateway init OK orderRef=$orderRef gatewayRef=${gatewayRef ?: "-"} status=${gatewayInit.data?.status}")
 
-        // 3. Wait for the customer to confirm on their phone (USSD/STK push), poll verify.
-        //    Using order.orderId to reliably check the status as per the gateway API doc
         val verifyRef = order.orderId
-
         emit(PaymentEvent.AwaitingCustomerConfirmation)
 
         val deadline = System.currentTimeMillis() + VERIFY_TIMEOUT_MS
@@ -312,15 +328,12 @@ object PaymentEngine {
             var currentStatus: String? = null
 
             try {
-                // Success response (HTTP 200)
                 val verify = PaymentGatewayClient.verifyPayment(verifyRef, "WALLET")
                 currentStatus = verify.data?.paymentStatus ?: verify.status
             }
             catch (e: retrofit2.HttpException) {
-                // 💡 Handle gateway HTTP Errors (400, 502) to break polling instantly
                 val body = runCatching { e.response()?.errorBody()?.string() }.getOrNull()
                 Log.w(TAG, "verify poll HTTP ${e.code()} body=$body")
-
                 if (body != null && body.contains("\"status\":\"ERROR\"", ignoreCase = true)) {
                     currentStatus = "ERROR"
                 } else if (e.code() == 400 || e.code() == 502) {
@@ -331,20 +344,10 @@ object PaymentEngine {
                 Log.w(TAG, "verify poll network error (will retry)", e)
             }
 
-            Log.d(TAG, "verify poll resolved status=$currentStatus")
-
             when (currentStatus?.uppercase()) {
-                "APPROVED", "SUCCESS" -> {
-                    finalStatus = "Approved"
-                    break
-                }
-                "DECLINED", "FAILED", "REJECTED", "CANCELLED", "ERROR" -> {
-                    finalStatus = "Declined"
-                    break
-                }
-                else -> {
-                    emit(PaymentEvent.Processing("En attente de confirmation du client..."))
-                }
+                "APPROVED", "SUCCESS" -> { finalStatus = "Approved"; break }
+                "DECLINED", "FAILED", "REJECTED", "CANCELLED", "ERROR" -> { finalStatus = "Declined"; break }
+                else -> emit(PaymentEvent.Processing("En attente de confirmation du client..."))
             }
         }
 
@@ -354,7 +357,6 @@ object PaymentEngine {
             return@flow
         }
 
-        // 4. Report the final outcome to the till.
         emit(PaymentEvent.Processing("Notification de la caisse..."))
         val providerRef = gatewayRef?.ifBlank { null } ?: orderRef
         val reported = runCatching {
@@ -363,7 +365,8 @@ object PaymentEngine {
                 PaymentResultReport(
                     status = finalStatus,
                     providerRef = providerRef,
-                    reason = if (finalStatus == "Declined") "Refusé par le fournisseur mobile money" else null
+                    reason = if (finalStatus == "Declined") "Refusé par le fournisseur mobile money" else null,
+                    splitPayments = if (finalStatus == "Approved") mapSplits(splitItems) else null // 🆕
                 )
             )
         }
@@ -391,7 +394,6 @@ object PaymentEngine {
         }
     }
 
-    /** Mask all but the last 3 digits — never log full phone numbers. */
     private fun maskPhone(phone: String): String =
         if (phone.length <= 3) "***" else "***${phone.takeLast(3)}"
 }
